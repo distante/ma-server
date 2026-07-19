@@ -29,7 +29,7 @@ from music_assistant_models.errors import (
     PlayerCommandFailed,
     UnsupportedFeaturedException,
 )
-from music_assistant_models.player import PlayerSource
+from music_assistant_models.player import OutputProtocol, PlayerSource
 
 from music_assistant.constants import ATTR_PREVIOUS_VOLUME, CONF_MUTE_CONTROL
 from music_assistant.controllers.players import PlayerController
@@ -1342,6 +1342,106 @@ class TestScheduleActiveOutputProtocolClear:
 
         wait_mock.assert_awaited_once_with(player, PlaybackState.IDLE, timeout=10)
         player.set_active_output_protocol.assert_called_once_with(None)
+
+
+class TestVolumeControlRouting:
+    """Test volume command routing to linked protocol players (issue https://github.com/music-assistant/support/issues/5443)."""
+
+    @staticmethod
+    def _build_universal_over_protocol(
+        mock_mass: MagicMock,
+    ) -> tuple[PlayerController, MockPlayer, MockPlayer, AsyncMock]:
+        """
+        Build a universal-style player that resolves volume to a linked protocol player.
+
+        Mirrors a non-Google Chromecast (PlayerType.PROTOCOL, native volume) wrapped by a
+        Universal Player that has no volume feature of its own and must redirect volume to
+        the linked protocol player. Returns the controller, the universal player, the
+        protocol player and an AsyncMock spying on the protocol player's volume_set.
+        """
+        controller = PlayerController(mock_mass)
+        cc_provider = MockProvider("chromecast", instance_id="chromecast--x", mass=mock_mass)
+        up_provider = MockProvider(
+            "universal_player", instance_id="universal_player", mass=mock_mass
+        )
+
+        # protocol player (chromecast) with native volume control
+        protocol = MockPlayer(cc_provider, "cc", "Chromecast", player_type=PlayerType.PROTOCOL)
+        protocol._attr_supported_features = {PlayerFeature.VOLUME_SET}
+        volume_spy = AsyncMock()  # spy on the native volume call
+        protocol.volume_set = volume_spy  # type: ignore[method-assign]
+        protocol._cache.clear()
+
+        # universal player: no volume feature of its own, redirects to the protocol player
+        universal = MockPlayer(up_provider, "up", "Universal", player_type=PlayerType.PLAYER)
+        universal._attr_supported_features = set()
+        universal.set_linked_output_protocols(
+            [
+                OutputProtocol(
+                    output_protocol_id="cc",
+                    name="Google Cast",
+                    protocol_domain="chromecast",
+                    priority=0,
+                    available=True,
+                )
+            ]
+        )
+        universal._cache.clear()
+
+        controller._players = {"cc": protocol, "up": universal}
+        mock_mass.players = controller
+        return controller, universal, protocol, volume_spy
+
+    async def test_volume_redirects_to_linked_protocol_player(self, mock_mass: MagicMock) -> None:
+        """Volume on a universal player redirects to its linked protocol player."""
+        controller, universal, _protocol, volume_spy = self._build_universal_over_protocol(
+            mock_mass
+        )
+        universal.update_state(signal_event=False)
+
+        assert universal.volume_control == "cc"
+        with patch.object(controller, "_get_active_audio_source", return_value=None):
+            await controller._handle_cmd_volume_set("up", 42)
+
+        volume_spy.assert_awaited_once_with(42)
+
+    async def test_volume_redirects_when_state_snapshot_is_stale(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """
+        Volume redirects even when the PlayerState snapshot's volume_control lags.
+
+        Regression test for https://github.com/music-assistant/support/issues/5443: the
+        redirect must use the live volume_control, not the
+        state snapshot. The snapshot's volume_control is only rewritten on a full recalc, so
+        it can pin at PLAYER_CONTROL_NONE while the protocol player links/comes online. If
+        the redirect reads the stale snapshot the command silently no-ops (no error, volume
+        unchanged) — the exact "can't set volume while idle" symptom on a wrapped Chromecast.
+        """
+        controller, universal, protocol, volume_spy = self._build_universal_over_protocol(mock_mass)
+
+        # 1) protocol player momentarily unavailable -> a full recalc pins the snapshot's
+        #    volume_control at PLAYER_CONTROL_NONE
+        protocol._attr_available = False
+        protocol._cache.clear()
+        universal.refresh_state(signal_event=False)
+        assert universal.state.volume_control == PLAYER_CONTROL_NONE
+
+        # 2) protocol player comes back online, but the universal player's own tracked
+        #    inputs are unchanged, so update_state clears its cache and early-returns
+        #    without rewriting the snapshot: live heals to "cc", snapshot stays "none"
+        protocol._attr_available = True
+        protocol._cache.clear()
+        universal.update_state(signal_event=False)
+
+        assert universal.volume_control == "cc"  # live, healed
+        assert universal.state.volume_control == PLAYER_CONTROL_NONE  # snapshot, stale
+
+        with patch.object(controller, "_get_active_audio_source", return_value=None):
+            await controller._handle_cmd_volume_set("up", 42)
+
+        # must route to the protocol player despite the stale snapshot
+        volume_spy.assert_awaited_once_with(42)
 
 
 if __name__ == "__main__":

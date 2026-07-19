@@ -3830,26 +3830,33 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             if active_queue is not None and active_queue.queue_id == player.player_id:
                 await plugin_prov.on_volume_change(audio_source.item_id, volume_level)
 
+        # Resolve the control target from the live volume_control, not the PlayerState
+        # snapshot: the snapshot only refreshes on a full recalc, so it can lag at
+        # PLAYER_CONTROL_NONE while the live value has healed to a linked protocol player
+        # (e.g. a Universal Player wrapping a Chromecast). Using one live value for the
+        # guards and the redirect below keeps them consistent, as cmd_volume_mute does.
+        # https://github.com/music-assistant/support/issues/5443
+        volume_control = player.volume_control
         # Handle native volume control support
-        if player.volume_control == PLAYER_CONTROL_NATIVE:
+        if volume_control == PLAYER_CONTROL_NATIVE:
             # player supports volume command natively: forward to player
             await player.volume_set(device_volume)
             return
         # Handle fake volume control support
-        if player.volume_control == PLAYER_CONTROL_FAKE:
+        if volume_control == PLAYER_CONTROL_FAKE:
             # user wants to use fake volume control - so we (optimistically) update the state
             # and store the state in the cache. Fake volume uses the logical volume (no scaling).
             player.extra_data[ATTR_FAKE_VOLUME] = volume_level
             player.update_state()
             return
         # player has no volume support at all
-        if player.volume_control == PLAYER_CONTROL_NONE:
+        if volume_control == PLAYER_CONTROL_NONE:
             raise UnsupportedFeaturedException(
                 f"Player {player.state.name} does not support volume control"
             )
         # handle external player control
-        if player_control := self._controls.get(player.state.volume_control):
-            control_name = player_control.name if player_control else player.state.volume_control
+        if player_control := self._controls.get(volume_control):
+            control_name = player_control.name if player_control else volume_control
             self.logger.debug("Redirecting volume command to PlayerControl %s", control_name)
             if not player_control or not player_control.supports_volume:
                 raise UnsupportedFeaturedException(
@@ -3860,7 +3867,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             # raw device volume and does not apply min/max scaling of its own
             await player_control.volume_set(device_volume)
             return
-        if protocol_player := self.get_player(player.state.volume_control):
+        if protocol_player := self.get_player(volume_control):
             # redirect to protocol player volume control.
             # forward the already-scaled device volume so the min/max limits configured
             # on this (user-facing) player are honored; the protocol player has no

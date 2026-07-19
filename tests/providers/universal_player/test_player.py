@@ -1,4 +1,4 @@
-"""Regression tests for universal player external-source delegation (#5443)."""
+"""Regression tests for universal player external-source delegation (https://github.com/music-assistant/support/issues/5443)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from music_assistant_models.constants import PLAYER_CONTROL_NATIVE
 from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
+from music_assistant_models.player import OutputProtocol
 
 from music_assistant.models.player import DeviceInfo, Player
 from music_assistant.providers.universal_player.player import UniversalPlayer
@@ -168,3 +169,38 @@ def test_no_features_without_external_source() -> None:
     )
     universal = _make_universal_player(mass, ["cc_1"])
     assert universal.supported_features == set()
+
+
+def test_idle_volume_resolves_to_linked_protocol_player() -> None:
+    """
+    An idle universal player still resolves volume to its linked protocol player.
+
+    Regression test for https://github.com/music-assistant/support/issues/5443: the universal player advertises no volume feature of its
+    own (supported_features is empty while idle), so volume_control must resolve to the
+    linked protocol player via the base Player's protocol fallback — not collapse to
+    PLAYER_CONTROL_NONE. A NONE result is the "can't set volume while idle" symptom.
+    """
+    mass = _make_mock_mass()
+    _make_chromecast_player(
+        mass,
+        "cc_1",
+        active_source=None,
+        features={PlayerFeature.VOLUME_SET, PlayerFeature.VOLUME_MUTE},
+    )
+    universal = _make_universal_player(mass, ["cc_1"])
+    universal.set_linked_output_protocols(
+        [
+            OutputProtocol(
+                output_protocol_id="cc_1",
+                name="Google Cast",
+                protocol_domain="chromecast",
+                priority=0,
+                available=True,
+            )
+        ]
+    )
+    universal._cache.clear()
+
+    assert universal.supported_features == set()  # idle: nothing of its own
+    assert universal.volume_control == "cc_1"  # but volume routes to the protocol player
+    assert universal.mute_control == "cc_1"
