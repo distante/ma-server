@@ -991,6 +991,8 @@ class TestVolumeScalingOnRedirect:
             protocol_parent_id=None,
             extra_data={},
             volume_control=volume_control,
+            mute_control=PLAYER_CONTROL_NONE,
+            resolved_volume_muted=False,
             volume_set=volume_set or AsyncMock(),
             update_state=MagicMock(),
             provider=MagicMock(),
@@ -1441,6 +1443,53 @@ class TestVolumeControlRouting:
             await controller._handle_cmd_volume_set("up", 42)
 
         # must route to the protocol player despite the stale snapshot
+        volume_spy.assert_awaited_once_with(42)
+
+    async def test_stale_snapshot_still_auto_unmutes_before_volume(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """
+        Auto-unmute-before-volume uses the live mute_control / resolved mute state.
+
+        Regression test for the mute half of the same stale-snapshot family: a muted
+        protocol-wrapped player whose PlayerState snapshot lags at PLAYER_CONTROL_NONE /
+        None must still be unmuted before the volume is set. Reading the snapshot would
+        silently skip the auto-unmute during the lag window; the fix reads the live
+        mute_control and resolved_volume_muted instead.
+        """
+        controller, universal, protocol, volume_spy = self._build_universal_over_protocol(mock_mass)
+        # protocol player supports mute and is currently muted
+        protocol._attr_supported_features = {PlayerFeature.VOLUME_SET, PlayerFeature.VOLUME_MUTE}
+        protocol._attr_volume_muted = True
+        protocol._cache.clear()
+
+        # 1) full recalc while the protocol player is unavailable pins BOTH snapshot fields
+        #    (mute_control -> NONE, resolved mute state -> None)
+        protocol._attr_available = False
+        protocol._cache.clear()
+        universal.refresh_state(signal_event=False)
+        assert universal.state.mute_control == PLAYER_CONTROL_NONE
+        assert not universal.state.volume_muted
+
+        # 2) protocol player comes back online (muted); a no-op update_state clears the cache
+        #    but leaves the snapshot stale, so live and snapshot diverge
+        protocol._attr_available = True
+        protocol._cache.clear()
+        universal.update_state(signal_event=False)
+        assert universal.mute_control == "cc"  # live, healed
+        assert universal.resolved_volume_muted is True  # live resolved mute state
+        assert universal.state.mute_control == PLAYER_CONTROL_NONE  # snapshot, stale
+
+        unmute = AsyncMock()
+        with (
+            patch.object(controller, "_get_active_audio_source", return_value=None),
+            patch.object(controller, "cmd_volume_mute", unmute),
+        ):
+            await controller._handle_cmd_volume_set("up", 42)
+
+        # the universal player is unmuted (via the live values) and the volume is routed
+        # to the cast; the recursion also unmutes the protocol player, hence assert_any_await
+        unmute.assert_any_await("up", False)
         volume_spy.assert_awaited_once_with(42)
 
 

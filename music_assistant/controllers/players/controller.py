@@ -3801,10 +3801,14 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         if not has_mute_lock and player.protocol_parent_id:
             if parent := self.get_player(player.protocol_parent_id):
                 has_mute_lock = parent.extra_data.get(ATTR_MUTE_LOCK, False)
+        # Read the live mute_control and resolved mute state rather than the PlayerState
+        # snapshot: for a protocol-wrapped player the snapshot can lag at
+        # PLAYER_CONTROL_NONE / None while the live values have healed, which would
+        # otherwise skip this auto-unmute (same staleness the volume redirect below avoids).
         if (
             not has_mute_lock
-            and player.state.mute_control not in (PLAYER_CONTROL_NONE, PLAYER_CONTROL_FAKE)
-            and player.state.volume_muted
+            and player.mute_control not in (PLAYER_CONTROL_NONE, PLAYER_CONTROL_FAKE)
+            and player.resolved_volume_muted
         ):
             # if player is muted and not locked, we unmute it first
             # skip this for fake mute since it uses volume to simulate mute

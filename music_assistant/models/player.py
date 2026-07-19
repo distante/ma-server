@@ -524,6 +524,19 @@ class Player(ABC):
         return self._attr_volume_muted
 
     @property
+    @final
+    def resolved_volume_muted(self) -> bool | None:
+        """
+        Return the mute state resolved through the configured mute control (read live).
+
+        Unlike ``volume_muted`` (the player's own raw state), this follows the
+        ``mute_control`` chain (fake/native/protocol player/player control). It is the
+        live equivalent of ``PlayerState.volume_muted`` without the snapshot lag, so
+        callers reacting to the current mute state should prefer it over the snapshot.
+        """
+        return self.__final_volume_muted_state
+
+    @property
     def active_source(self) -> str | None:
         """
         Return the (id of) the active source of the player.
